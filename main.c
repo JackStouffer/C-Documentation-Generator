@@ -1,7 +1,3 @@
-// cc: clang -std=c11 c2md.c -o c2md $(pkg-config --cflags --libs libclang)
-// or: clang -std=c11 c2md.c -o c2md -I$(llvm-config --includedir) -L$(llvm-config --libdir) -lclang
-// usage: ./c2md file1.h file2.c ... -- -Iinclude -DDEBUG > API.md
-
 #include <clang-c/Index.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -187,8 +183,8 @@ static enum CXChildVisitResult tu_visitor(CXCursor c, CXCursor parent, CXClientD
 
     switch (k) {
         case CXCursor_FunctionDecl:
-            // Skip implicit or no prototypes?
-            if (clang_isCursorDefinition(c)) emit_function(c);
+            // Emit the first declaration/definition we encounter; USR dedupe avoids repeats.
+            emit_function(c);
             break;
         case CXCursor_StructDecl: emit_record(c, "Struct"); break;
         case CXCursor_UnionDecl:  emit_record(c, "Union");  break;
