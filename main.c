@@ -1,4 +1,5 @@
 #include <clang-c/Index.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,11 +10,99 @@ typedef struct {
     size_t n, cap;
 } StrSet;
 
+typedef struct {
+    char *name;
+    char *anchor;
+    char *kind;
+} Entry;
+
+typedef struct {
+    Entry *data;
+    size_t n, cap;
+} EntryVec;
+
+static FILE *g_out;
+static EntryVec g_macros, g_types, g_functions;
+
 static void die(const char *msg) { fprintf(stderr, "error: %s\n", msg); exit(1); }
 
-static bool cursor_is_in_main_file(CXCursor c) {
+static bool cursor_is_in_system_header(CXCursor c) {
     CXSourceLocation loc = clang_getCursorLocation(c);
-    return clang_Location_isFromMainFile(loc);
+    return clang_Location_isInSystemHeader(loc);
+}
+
+static void entryvec_add(EntryVec *vec, const char *name, const char *anchor, const char *kind) {
+    if (vec->n == vec->cap) {
+        vec->cap = vec->cap ? vec->cap * 2 : 64;
+        vec->data = (Entry*)realloc(vec->data, vec->cap * sizeof(Entry));
+    }
+    vec->data[vec->n].name = strdup(name);
+    vec->data[vec->n].anchor = strdup(anchor);
+    vec->data[vec->n].kind = (kind && *kind) ? strdup(kind) : NULL;
+    vec->n++;
+}
+
+static void entryvec_free(EntryVec *vec) {
+    for (size_t i = 0; i < vec->n; ++i) {
+        free(vec->data[i].name);
+        free(vec->data[i].anchor);
+        free(vec->data[i].kind);
+    }
+    free(vec->data);
+    vec->data = NULL;
+    vec->n = vec->cap = 0;
+}
+
+static char *make_anchor(const char *prefix, const char *name) {
+    size_t plen = strlen(prefix);
+    size_t nlen = strlen(name);
+    size_t cap = plen + nlen * 2 + 4;
+    char *buf = (char*)malloc(cap);
+    size_t pos = 0;
+    for (size_t i = 0; i < plen; ++i) {
+        buf[pos++] = (char)tolower((unsigned char)prefix[i]);
+    }
+    if (pos && buf[pos - 1] != '-') buf[pos++] = '-';
+    bool last_dash = (pos && buf[pos - 1] == '-');
+    for (size_t i = 0; i < nlen; ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (isalnum(c) || c == '_') {
+            buf[pos++] = (char)tolower(c);
+            last_dash = false;
+        } else {
+            if (!last_dash && pos > 0) {
+                buf[pos++] = '-';
+                last_dash = true;
+            }
+        }
+        if (pos + 2 >= cap) {
+            cap *= 2;
+            buf = (char*)realloc(buf, cap);
+        }
+    }
+    while (pos > 0 && buf[pos - 1] == '-') pos--;
+    if (pos == 0) {
+        buf[pos++] = 'x';
+    }
+    buf[pos] = '\0';
+    return buf;
+}
+
+static void print_summary_section(const char *title, EntryVec *vec, bool include_kind) {
+    printf("## %s\n\n", title);
+    if (vec->n == 0) {
+        printf("- (none)\n\n");
+        return;
+    }
+    for (size_t i = 0; i < vec->n; ++i) {
+        Entry *e = &vec->data[i];
+        if (include_kind && e->kind) {
+            printf("- [%s `%s`](#%s)\n", e->kind, e->name, e->anchor);
+        } else {
+            printf("- [`%s`](#%s)\n", e->name, e->anchor);
+        }
+    }
+    printf("\n");
 }
 
 static void set_add(StrSet *s, const char *key) {
@@ -38,7 +127,7 @@ static void print_location(CXCursor c) {
     CXFile file; unsigned line, col, off;
     clang_getSpellingLocation(loc, &file, &line, &col, &off);
     char *path = dup_cx(clang_getFileName(file));
-    if (path && *path) printf("\n*Defined at*: `%s:%u`\n\n", path, line);
+    if (path && *path) fprintf(g_out, "\n*Defined at*: `%s:%u`\n\n", path, line);
     free(path);
 }
 
@@ -46,13 +135,13 @@ static void print_md_comment(CXCursor c) {
     char *raw = dup_cx(clang_Cursor_getRawCommentText(c));
     if (raw && *raw) {
         // Strip leading /** or /// a bit (minimal cleanup)
-        printf("%s\n\n", raw);
+        fprintf(g_out, "%s\n\n", raw);
     }
     free(raw);
 }
 
 static void print_code_block(const char *code) {
-    printf("```c\n%s\n```\n\n", code);
+    fprintf(g_out, "```c\n%s\n```\n\n", code);
 }
 
 static char *cursor_usr(CXCursor c) { return dup_cx(clang_getCursorUSR(c)); }
@@ -93,16 +182,21 @@ static char *range_text(CXTranslationUnit tu, CXSourceRange range) {
 /* Print function prototype */
 static void emit_function(CXCursor c) {
     char *name = cursor_name(c);
+    const char *anchor_key = (*name) ? name : "anonymous";
+    char *anchor = make_anchor("function", anchor_key);
+    entryvec_add(&g_functions, anchor_key, anchor, NULL);
+    fprintf(g_out, "<a id=\"%s\"></a>\n", anchor);
     CXType ft = clang_getCursorType(c);
     CXType rt = clang_getResultType(ft);
     char *rts = type_spelling(rt);
     char *disp = dup_cx(clang_getCursorDisplayName(c)); // name(params)
-    printf("### Function: `%s`\n\n", name);
+    fprintf(g_out, "### Function: `%s`\n\n", name);
     print_md_comment(c);
     char line[4096];
     snprintf(line, sizeof(line), "%s %s;", rts, disp);
     print_code_block(line);
     print_location(c);
+    free(anchor);
     free(name); free(rts); free(disp);
 }
 
@@ -112,12 +206,12 @@ static enum CXChildVisitResult struct_enum_visitor(CXCursor c, CXCursor parent, 
     if (k == CXCursor_FieldDecl) {
         char *nm = cursor_name(c);
         char *ts = type_spelling(clang_getCursorType(c));
-        printf("- `%s %s;`\n", ts, nm);
+        fprintf(g_out, "- `%s %s;`\n", ts, nm);
         free(nm); free(ts);
     } else if (k == CXCursor_EnumConstantDecl) {
         char *nm = cursor_name(c);
         long long val = clang_getEnumConstantDeclValue(c);
-        printf("- `%s = %lld`\n", nm, val);
+        fprintf(g_out, "- `%s = %lld`\n", nm, val);
         free(nm);
     }
     return CXChildVisit_Continue;
@@ -125,12 +219,19 @@ static enum CXChildVisitResult struct_enum_visitor(CXCursor c, CXCursor parent, 
 
 static void emit_record(CXCursor c, const char *what) {
     char *name = cursor_name(c);
-    printf("### %s: `%s`\n\n", what, *name ? name : "(anonymous)");
+    const char *display = (*name) ? name : "(anonymous)";
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "type-%s", what);
+    char *anchor = make_anchor(prefix, display);
+    entryvec_add(&g_types, display, anchor, what);
+    fprintf(g_out, "<a id=\"%s\"></a>\n", anchor);
+    fprintf(g_out, "### %s: `%s`\n\n", what, display);
     print_md_comment(c);
     // List members
     clang_visitChildren(c, struct_enum_visitor, NULL);
-    printf("\n");
+    fprintf(g_out, "\n");
     print_location(c);
+    free(anchor);
     free(name);
 }
 
@@ -138,18 +239,27 @@ static void emit_typedef(CXCursor c) {
     char *name = cursor_name(c);
     CXType ut = clang_getTypedefDeclUnderlyingType(c);
     char *uts = type_spelling(ut);
-    printf("### Typedef: `%s`\n\n", name);
+    const char *display = (*name) ? name : "(anonymous)";
+    char *anchor = make_anchor("type-typedef", display);
+    entryvec_add(&g_types, display, anchor, "Typedef");
+    fprintf(g_out, "<a id=\"%s\"></a>\n", anchor);
+    fprintf(g_out, "### Typedef: `%s`\n\n", name);
     print_md_comment(c);
     char line[4096];
     snprintf(line, sizeof(line), "typedef %s %s;", uts, name);
     print_code_block(line);
     print_location(c);
+    free(anchor);
     free(name); free(uts);
 }
 
 static void emit_macro(CXCursor c, CXTranslationUnit tu) {
     char *name = cursor_name(c);
-    printf("### Macro: `%s`\n\n", name);
+    const char *display = (*name) ? name : "(anonymous)";
+    char *anchor = make_anchor("macro", display);
+    entryvec_add(&g_macros, display, anchor, NULL);
+    fprintf(g_out, "<a id=\"%s\"></a>\n", anchor);
+    fprintf(g_out, "### Macro: `%s`\n\n", name);
     // libclang rarely attaches raw comments to macros; still try:
     print_md_comment(c);
     // Reconstruct the #define line/body
@@ -163,6 +273,7 @@ static void emit_macro(CXCursor c, CXTranslationUnit tu) {
     }
     print_code_block(txt);
     print_location(c);
+    free(anchor);
     free(txt); free(name);
 }
 
@@ -191,8 +302,8 @@ static enum CXChildVisitResult tu_visitor(CXCursor c, CXCursor parent, CXClientD
         case CXCursor_EnumDecl:   emit_record(c, "Enum");   break;
         case CXCursor_TypedefDecl: emit_typedef(c); break;
         case CXCursor_MacroDefinition:
-            // Only include macros actually defined in the main file passed to clang
-            if (cursor_is_in_main_file(c)) {
+            // Skip system headers, but allow project/local headers included by the file.
+            if (!cursor_is_in_system_header(c)) {
                 emit_macro(c, ctx->tu);
             }
             break;
@@ -214,7 +325,7 @@ static void process_file(CXIndex idx, const char *path, int clang_argc, const ch
 
     Ctx ctx = {0};
     ctx.tu = tu;
-    printf("## File: %s\n\n", path);
+    fprintf(g_out, "## File: %s\n\n", path);
     clang_visitChildren(clang_getTranslationUnitCursor(tu), tu_visitor, &ctx);
     clang_disposeTranslationUnit(tu);
 
@@ -236,12 +347,27 @@ int main(int argc, const char **argv) {
     int cargc = (split < argc) ? (argc - split - 1) : 0;
     const char **cargv = (cargc > 0) ? (argv + split + 1) : NULL;
 
+    FILE *body = tmpfile();
+    if (!body) die("failed to allocate temporary buffer");
+    g_out = body;
     printf("# API Documentation\n\n");
-
     CXIndex idx = clang_createIndex(/*excludeDeclsFromPCH=*/0, /*displayDiagnostics=*/0);
     for (int i = 1; i <= nfiles; ++i) {
         process_file(idx, argv[i], cargc, cargv);
     }
     clang_disposeIndex(idx);
+    print_summary_section("Macros", &g_macros, false);
+    print_summary_section("Types", &g_types, true);
+    print_summary_section("Functions", &g_functions, false);
+    rewind(body);
+    char buf[4096];
+    size_t read_bytes;
+    while ((read_bytes = fread(buf, 1, sizeof(buf), body)) > 0) {
+        fwrite(buf, 1, read_bytes, stdout);
+    }
+    fclose(body);
+    entryvec_free(&g_macros);
+    entryvec_free(&g_types);
+    entryvec_free(&g_functions);
     return 0;
 }
