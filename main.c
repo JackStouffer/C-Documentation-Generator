@@ -740,6 +740,7 @@ static void emit_function(CXCursor c) {
     snprintf(line, sizeof(line), "%s %s;", rts, disp);
     print_code_block(line);
     print_location(c);
+    fprintf(g_out, "---\n\n");
     free(anchor);
     free(name); free(rts); free(disp);
 }
@@ -779,6 +780,7 @@ static void emit_record(CXCursor c, const char *what) {
     clang_visitChildren(c, struct_enum_visitor, NULL);
     fprintf(g_out, "\n");
     print_location(c);
+    fprintf(g_out, "---\n\n");
     free(anchor);
     free(name);
 }
@@ -802,6 +804,7 @@ static void emit_typedef(CXCursor c) {
     snprintf(line, sizeof(line), "typedef %s %s;", uts, name);
     print_code_block(line);
     print_location(c);
+    fprintf(g_out, "---\n\n");
     free(anchor);
     free(name); free(uts);
 }
@@ -838,6 +841,7 @@ static void emit_macro(CXCursor c, CXTranslationUnit tu) {
     }
     print_code_block(txt);
     print_location(c);
+    fprintf(g_out, "---\n\n");
     free(anchor);
     free(txt); free(name);
 }
