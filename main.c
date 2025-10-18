@@ -143,6 +143,21 @@ static bool pattern_match(const char *pat, const char *text) {
     return false;
 }
 
+static char *dup_cx(CXString s) {
+    const char *c = clang_getCString(s);
+    char *r = strdup(c ? c : "");
+    clang_disposeString(s);
+    return r;
+}
+
+static char *dup_range(const char *src, size_t len) {
+    char *out = (char*)malloc(len + 1);
+    if (!out) die("out of memory");
+    memcpy(out, src, len);
+    out[len] = '\0';
+    return out;
+}
+
 static bool should_ignore(const char *name) {
     if (!name || !*name || g_ignore_patterns.n == 0) return false;
     for (size_t i = 0; i < g_ignore_patterns.n; ++i) {
@@ -151,11 +166,185 @@ static bool should_ignore(const char *name) {
     return false;
 }
 
-static char *dup_cx(CXString s) {
-    const char *c = clang_getCString(s);
-    char *r = strdup(c ? c : "");
-    clang_disposeString(s);
-    return r;
+static char *extract_macro_comment(CXTranslationUnit tu, CXCursor cursor) {
+    CXSourceRange range = clang_getCursorExtent(cursor);
+    CXSourceLocation start_loc = clang_getRangeStart(range);
+    CXFile file = NULL;
+    unsigned line = 0, col = 0;
+    unsigned offset = 0;
+    clang_getSpellingLocation(start_loc, &file, &line, &col, &offset);
+    if (!file) return NULL;
+    size_t buf_len = 0;
+    const char *buf = clang_getFileContents(tu, file, &buf_len);
+    if (!buf || offset == 0 || offset > buf_len) return NULL;
+
+    size_t pos = offset;
+    while (pos > 0 && buf[pos - 1] != '\n') pos--;
+    // Skip whitespace between comment and macro; stop if blank line encountered
+    size_t idx = pos;
+    while (idx > 0 && isspace((unsigned char)buf[idx - 1])) {
+        if (buf[idx - 1] == '\n') {
+            size_t line_start = idx - 1;
+            while (line_start > 0 && buf[line_start - 1] != '\n') line_start--;
+            bool non_ws = false;
+            for (size_t i = line_start; i < idx - 1; ++i) {
+                if (!isspace((unsigned char)buf[i])) { non_ws = true; break; }
+            }
+            if (!non_ws) {
+                return NULL; // blank line separating comment
+            }
+        }
+        idx--;
+    }
+    if (idx == 0) return NULL;
+    size_t end = idx;
+
+    // Attempt block comment detection
+    if (end >= 2 && buf[end - 2] == '*' && buf[end - 1] == '/') {
+        size_t start_pos = end - 2;
+        while (start_pos > 0) {
+            if (buf[start_pos - 1] == '/' && buf[start_pos] == '*') {
+                start_pos--;
+                break;
+            }
+            start_pos--;
+        }
+        if (buf[start_pos] != '/' || buf[start_pos + 1] != '*') return NULL;
+        size_t len = end - start_pos;
+        return dup_range(buf + start_pos, len);
+    }
+
+    // Attempt line comment detection (// or ///) accumulating contiguous block
+    size_t comment_start = end;
+    size_t cur = end;
+    bool saw_comment = false;
+    while (cur > 0) {
+        size_t line_end = cur;
+        size_t line_start = cur;
+        while (line_start > 0 && buf[line_start - 1] != '\n') line_start--;
+        size_t i = line_start;
+        while (i < line_end && isspace((unsigned char)buf[i])) i++;
+        if (i + 1 < line_end && buf[i] == '/' && buf[i + 1] == '/') {
+            saw_comment = true;
+            comment_start = line_start;
+            cur = line_start;
+            if (cur > 0 && buf[cur - 1] == '\n') cur--;
+            continue;
+        }
+        break;
+    }
+    if (saw_comment) {
+        size_t len = end - comment_start;
+        return dup_range(buf + comment_start, len);
+    }
+
+    return NULL;
+}
+
+static char *normalize_comment(const char *raw) {
+    if (!raw || !*raw) return NULL;
+    size_t raw_len = strlen(raw);
+    if (raw_len == 0) return NULL;
+    bool is_block = raw_len >= 2 && raw[0] == '/' && raw[1] == '*';
+    bool is_line = raw_len >= 2 && raw[0] == '/' && raw[1] == '/';
+    if (!is_block && !is_line) return dup_range(raw, raw_len);
+
+    const char *p = raw;
+    const char *end = raw + raw_len;
+    if (is_block) {
+        p += 2;
+        while (p < end && *p == '*') p++;
+        if (p < end && *p == ' ') p++;
+    }
+
+    char **lines = NULL;
+    size_t *lens = NULL;
+    size_t n = 0, cap = 0;
+
+    while (p < end) {
+        const char *line_end = memchr(p, '\n', end - p);
+        bool has_newline = line_end != NULL;
+        const char *line_stop = has_newline ? line_end : end;
+        if (line_stop > p && line_stop[-1] == '\r') line_stop--;
+
+        const char *s = p;
+        if (is_block) {
+            while (s < line_stop && (*s == ' ' || *s == '\t')) s++;
+            if (s < line_stop && *s == '*') {
+                s++;
+                if (s < line_stop && *s == ' ') s++;
+            }
+            if (!has_newline) {
+                const char *tmp_end = line_stop;
+                while (tmp_end > s && isspace((unsigned char)tmp_end[-1])) tmp_end--;
+                if (tmp_end >= s + 2 && tmp_end[-2] == '*' && tmp_end[-1] == '/') tmp_end -= 2;
+                while (tmp_end > s && isspace((unsigned char)tmp_end[-1])) tmp_end--;
+                line_stop = tmp_end;
+            }
+        } else {
+            while (s < line_stop && (*s == ' ' || *s == '\t')) s++;
+            if (s < line_stop && s[0] == '/' && s + 1 < line_stop && s[1] == '/') {
+                s += 2;
+                while (s < line_stop && *s == '/') s++;
+                if (s < line_stop && *s == ' ') s++;
+            }
+        }
+
+        const char *trim_end = line_stop;
+        while (trim_end > s && trim_end[-1] == '\r') trim_end--;
+        size_t seg = trim_end > s ? (size_t)(trim_end - s) : 0;
+        if (is_block && seg == 1 && s[0] == '/') {
+            seg = 0;
+        }
+
+        if (cap == n) {
+            cap = cap ? cap * 2 : 8;
+            lines = (char**)realloc(lines, cap * sizeof(char*));
+            lens = (size_t*)realloc(lens, cap * sizeof(size_t));
+            if (!lines || !lens) die("out of memory");
+        }
+        lines[n] = (seg > 0) ? dup_range(s, seg) : strdup("");
+        lens[n] = seg;
+        n++;
+
+        if (!has_newline) break;
+        p = line_end + 1;
+    }
+
+    size_t start_idx = 0;
+    while (start_idx < n && lens[start_idx] == 0) start_idx++;
+    size_t end_idx = n;
+    while (end_idx > start_idx && lens[end_idx - 1] == 0) end_idx--;
+
+    if (start_idx == end_idx) {
+        for (size_t i = 0; i < n; ++i) free(lines[i]);
+        free(lines);
+        free(lens);
+        return NULL;
+    }
+    for (size_t i = 0; i < start_idx; ++i) free(lines[i]);
+    for (size_t i = end_idx; i < n; ++i) free(lines[i]);
+
+    size_t total = 0;
+    for (size_t i = start_idx; i < end_idx; ++i) {
+        total += lens[i];
+        if (i + 1 < end_idx) total++;
+    }
+    char *result = (char*)malloc(total + 1);
+    if (!result) die("out of memory");
+    size_t pos = 0;
+    for (size_t i = start_idx; i < end_idx; ++i) {
+        if (i > start_idx) result[pos++] = '\n';
+        if (lens[i] > 0) {
+            memcpy(result + pos, lines[i], lens[i]);
+            pos += lens[i];
+        }
+        free(lines[i]);
+    }
+    result[pos] = '\0';
+    free(lines);
+    free(lens);
+    return result;
 }
 
 static void print_location(CXCursor c) {
@@ -167,13 +356,17 @@ static void print_location(CXCursor c) {
     free(path);
 }
 
-static void print_md_comment(CXCursor c) {
+static bool print_md_comment(CXCursor c) {
     char *raw = dup_cx(clang_Cursor_getRawCommentText(c));
-    if (raw && *raw) {
-        // Strip leading /** or /// a bit (minimal cleanup)
-        fprintf(g_out, "%s\n\n", raw);
-    }
+    char *norm = normalize_comment(raw);
     free(raw);
+    if (norm && *norm) {
+        fprintf(g_out, "%s\n\n", norm);
+        free(norm);
+        return true;
+    }
+    free(norm);
+    return false;
 }
 
 static void print_code_block(const char *code) {
@@ -314,7 +507,15 @@ static void emit_macro(CXCursor c, CXTranslationUnit tu) {
     fprintf(g_out, "<a id=\"%s\"></a>\n", anchor);
     fprintf(g_out, "### Macro: `%s`\n\n", name);
     // libclang rarely attaches raw comments to macros; still try:
-    print_md_comment(c);
+    if (!print_md_comment(c)) {
+        char *manual = extract_macro_comment(tu, c);
+        char *norm = normalize_comment(manual);
+        if (norm && *norm) {
+            fprintf(g_out, "%s\n\n", norm);
+        }
+        free(norm);
+        free(manual);
+    }
     // Reconstruct the #define line/body
     CXSourceRange r = clang_getCursorExtent(c);
     char *txt = range_text(tu, r);
