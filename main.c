@@ -330,9 +330,50 @@ static char *doxygen_to_markdown(const char *text) {
     return result;
 }
 
+typedef struct {
+    char *name;
+    char *doc;
+} FileDoc;
+
+typedef struct {
+    FileDoc *data;
+    size_t n, cap;
+} FileDocVec;
+
+static void filedocs_add(FileDocVec *vec, const char *path, char *doc) {
+    if (!doc) return;
+    if (vec->n == vec->cap) {
+        vec->cap = vec->cap ? vec->cap * 2 : 8;
+        vec->data = (FileDoc*)realloc(vec->data, vec->cap * sizeof(FileDoc));
+        if (!vec->data) die("out of memory");
+    }
+    const char *slash = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    const char *base = path;
+    if (slash && bslash) base = (slash > bslash) ? slash + 1 : bslash + 1;
+    else if (slash) base = slash + 1;
+    else if (bslash) base = bslash + 1;
+    char *name = strdup(base);
+    if (!name) die("out of memory");
+    vec->data[vec->n].name = name;
+    vec->data[vec->n].doc = doc;
+    vec->n++;
+}
+
+static void filedocs_free(FileDocVec *vec) {
+    for (size_t i = 0; i < vec->n; ++i) {
+        free(vec->data[i].name);
+        free(vec->data[i].doc);
+    }
+    free(vec->data);
+    vec->data = NULL;
+    vec->n = vec->cap = 0;
+}
+
 static FILE *g_out;
 static EntryVec g_macros, g_types, g_functions;
 static StrSet g_ignore_patterns;
+static FileDocVec g_file_docs;
 
 static void die(const char *msg) { fprintf(stderr, "error: %s\n", msg); exit(1); }
 
@@ -658,6 +699,113 @@ static char *normalize_comment(const char *raw) {
     return md;
 }
 
+static char *extract_file_doc(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    long sz = ftell(fp);
+    if (sz <= 0) { fclose(fp); return NULL; }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return NULL; }
+    size_t len = (size_t)sz;
+    char *buf = (char*)malloc(len + 1);
+    if (!buf) { fclose(fp); die("out of memory"); }
+    size_t readn = fread(buf, 1, len, fp);
+    fclose(fp);
+    if (readn != len) { free(buf); return NULL; }
+    buf[len] = '\0';
+
+    size_t pos = 0;
+    if (len >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF)
+        pos = 3;
+
+    while (pos < len && (buf[pos] == ' ' || buf[pos] == '\t' || buf[pos] == '\r' || buf[pos] == '\n'))
+        pos++;
+    if (pos >= len) { free(buf); return NULL; }
+
+    char *raw = NULL;
+    if (buf[pos] == '/' && pos + 1 < len) {
+        if (buf[pos + 1] == '*') {
+            size_t cur = pos + 2;
+            while (cur + 1 < len && !(buf[cur] == '*' && buf[cur + 1] == '/')) cur++;
+            if (cur + 1 >= len) { free(buf); return NULL; }
+            cur += 2;
+            raw = dup_range(buf + pos, cur - pos);
+        } else if (buf[pos + 1] == '/') {
+            size_t cur = pos;
+            while (cur < len) {
+                if (buf[cur] == '\r' || buf[cur] == '\n') {
+                    size_t after = cur;
+                    if (buf[cur] == '\r' && cur + 1 < len && buf[cur + 1] == '\n') after = cur + 2;
+                    else after = cur + 1;
+                    size_t peek = after;
+                    while (peek < len && (buf[peek] == ' ' || buf[peek] == '\t')) peek++;
+                    if (peek + 1 < len && buf[peek] == '/' && buf[peek + 1] == '/') {
+                        cur = after;
+                        continue;
+                    } else {
+                        cur = after;
+                        break;
+                    }
+                } else {
+                    cur++;
+                }
+            }
+            raw = dup_range(buf + pos, cur - pos);
+        }
+    }
+
+    free(buf);
+    if (!raw) return NULL;
+    char *md = normalize_comment(raw);
+    free(raw);
+    return md;
+}
+
+static char *bump_markdown_headers(const char *text) {
+    if (!text || !*text) return NULL;
+    StrBuf out = {0};
+    const char *p = text;
+    bool in_code_block = false;
+
+    while (*p) {
+        const char *line_end = strchr(p, '\n');
+        size_t len = line_end ? (size_t)(line_end - p) : strlen(p);
+        const char *line_start = p;
+        const char *trim = line_start;
+        while ((size_t)(trim - line_start) < len && (*trim == ' ' || *trim == '\t')) trim++;
+        size_t trimmed_len = len - (size_t)(trim - line_start);
+
+        bool is_fence = (trimmed_len >= 3 && strncmp(trim, "```", 3) == 0);
+        if (is_fence) {
+            in_code_block = !in_code_block;
+        }
+
+        if (!in_code_block && !is_fence && trimmed_len > 0 && trim[0] == '#') {
+            size_t hash_count = 0;
+            while (hash_count < trimmed_len && trim[hash_count] == '#') hash_count++;
+            size_t new_level = hash_count < 6 ? hash_count + 1 : 6;
+            sb_append_n(&out, line_start, (size_t)(trim - line_start));
+            for (size_t i = 0; i < new_level; ++i) sb_append_char(&out, '#');
+            const char *rest = trim + hash_count;
+            size_t rest_len = len - (size_t)(rest - line_start);
+            if (rest_len > 0) sb_append_n(&out, rest, rest_len);
+        } else {
+            sb_append_n(&out, line_start, len);
+        }
+
+        if (line_end) {
+            sb_append_char(&out, '\n');
+            p = line_end + 1;
+        } else {
+            break;
+        }
+    }
+
+    char *result = sb_detach(&out);
+    sb_free(&out);
+    return result;
+}
+
 static void print_location(CXCursor c) {
     CXSourceLocation loc = clang_getCursorLocation(c);
     CXFile file; unsigned line, col, off;
@@ -882,6 +1030,14 @@ static enum CXChildVisitResult tu_visitor(CXCursor c, CXCursor parent, CXClientD
 }
 
 static void process_file(CXIndex idx, const char *path, int clang_argc, const char **clang_argv) {
+    char *file_doc = extract_file_doc(path);
+    bool have_file_doc = file_doc && *file_doc;
+    if (have_file_doc) {
+        filedocs_add(&g_file_docs, path, file_doc);
+    } else {
+        free(file_doc);
+        file_doc = NULL;
+    }
     unsigned opts = CXTranslationUnit_DetailedPreprocessingRecord |
                     CXTranslationUnit_IncludeBriefCommentsInCodeCompletion;
     CXTranslationUnit tu = NULL;
@@ -895,6 +1051,11 @@ static void process_file(CXIndex idx, const char *path, int clang_argc, const ch
     Ctx ctx = {0};
     ctx.tu = tu;
     fprintf(g_out, "## File: %s\n\n", path);
+    if (have_file_doc) {
+        char *adjusted = bump_markdown_headers(file_doc);
+        fprintf(g_out, "%s\n\n", adjusted ? adjusted : file_doc);
+        free(adjusted);
+    }
     clang_visitChildren(clang_getTranslationUnitCursor(tu), tu_visitor, &ctx);
     clang_disposeTranslationUnit(tu);
 
@@ -952,6 +1113,7 @@ int main(int argc, const char **argv) {
     entryvec_free(&g_macros);
     entryvec_free(&g_types);
     entryvec_free(&g_functions);
+    filedocs_free(&g_file_docs);
     set_free(&g_ignore_patterns);
     return 0;
 }
