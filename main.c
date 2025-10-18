@@ -1063,9 +1063,28 @@ static void process_file(CXIndex idx, const char *path, int clang_argc, const ch
     set_free(&ctx.seen);
 }
 
+static void print_help(const char *prog) {
+    printf("Usage: %s [options] <file.c|file.h>... [-- <clang-args...>]\n", prog);
+    printf("Generate Markdown documentation for C headers or sources.\n\n");
+    printf("Options:\n");
+    printf("  -h, --help          Show this help message and exit\n");
+    printf("  --ignore PATTERN    Skip symbols whose names match PATTERN (* and ? supported)\n");
+}
+
 int main(int argc, const char **argv) {
+    for (int i = 1; i < argc && strcmp(argv[i], "--") != 0; ++i) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_help(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[i], "--ignore") == 0) {
+            ++i; // skip pattern placeholder if present
+        }
+    }
+
     if (argc < 2) {
         fprintf(stderr, "usage: %s <file.c|file.h>... [-- <clang-args...>]\n", argv[0]);
+        fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
         return 2;
     }
     int argi = 1;
