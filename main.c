@@ -5,6 +5,9 @@
 #include <string.h>
 #include <stdbool.h>
 
+static void die(const char *msg);
+static char *dup_range(const char *src, size_t len);
+
 typedef struct {
     char **data;
     size_t n, cap;
@@ -20,6 +23,312 @@ typedef struct {
     Entry *data;
     size_t n, cap;
 } EntryVec;
+
+typedef struct {
+    char *buf;
+    size_t len, cap;
+} StrBuf;
+
+static void sb_free(StrBuf *sb) {
+    free(sb->buf);
+    sb->buf = NULL;
+    sb->len = sb->cap = 0;
+}
+
+static void sb_reserve(StrBuf *sb, size_t extra) {
+    size_t need = sb->len + extra + 1;
+    if (need <= sb->cap) return;
+    size_t newcap = sb->cap ? sb->cap * 2 : 64;
+    while (newcap < need) newcap *= 2;
+    sb->buf = (char*)realloc(sb->buf, newcap);
+    if (!sb->buf) die("out of memory");
+    sb->cap = newcap;
+}
+
+static void sb_append_n(StrBuf *sb, const char *s, size_t n) {
+    if (n == 0) return;
+    sb_reserve(sb, n);
+    memcpy(sb->buf + sb->len, s, n);
+    sb->len += n;
+    sb->buf[sb->len] = '\0';
+}
+
+static void sb_append(StrBuf *sb, const char *s) {
+    if (!s) return;
+    sb_append_n(sb, s, strlen(s));
+}
+
+static void sb_append_char(StrBuf *sb, char c) {
+    sb_reserve(sb, 1);
+    sb->buf[sb->len++] = c;
+    sb->buf[sb->len] = '\0';
+}
+
+static void sb_trim_trailing_space(StrBuf *sb) {
+    while (sb->len > 0) {
+        char c = sb->buf[sb->len - 1];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+        sb->len--;
+    }
+    if (sb->buf) sb->buf[sb->len] = '\0';
+}
+
+static void sb_ensure_blank_line(StrBuf *sb) {
+    if (sb->len == 0) return;
+    if (sb->len >= 2 && sb->buf[sb->len - 1] == '\n' && sb->buf[sb->len - 2] == '\n')
+        return;
+    if (sb->buf[sb->len - 1] != '\n') sb_append_char(sb, '\n');
+    if (sb->len < 2 || sb->buf[sb->len - 2] != '\n') sb_append_char(sb, '\n');
+}
+
+static void sb_append_code_block(StrBuf *sb, const char *code, const char *lang) {
+    if (!code) code = "";
+    sb_ensure_blank_line(sb);
+    sb_append(sb, "```");
+    if (lang && *lang) {
+        if (lang[0] == '.') lang++;
+        sb_append(sb, lang);
+    }
+    sb_append(sb, "\n");
+    sb_append(sb, code);
+    size_t clen = strlen(code);
+    if (clen == 0 || code[clen - 1] != '\n') sb_append_char(sb, '\n');
+    sb_append(sb, "```\n");
+}
+
+static char *sb_detach(StrBuf *sb) {
+    if (!sb->buf) return NULL;
+    sb_reserve(sb, 0);
+    char *out = sb->buf;
+    sb->buf = NULL;
+    sb->len = sb->cap = 0;
+    return out;
+}
+
+typedef struct {
+    char *name;
+    StrBuf desc;
+} ParamDoc;
+
+typedef struct {
+    ParamDoc *data;
+    size_t n, cap;
+} ParamVec;
+
+static ParamDoc *paramvec_push(ParamVec *vec, const char *name) {
+    if (vec->n == vec->cap) {
+        vec->cap = vec->cap ? vec->cap * 2 : 8;
+        vec->data = (ParamDoc*)realloc(vec->data, vec->cap * sizeof(ParamDoc));
+        if (!vec->data) die("out of memory");
+    }
+    ParamDoc *entry = &vec->data[vec->n++];
+    entry->name = strdup(name ? name : "");
+    entry->desc.buf = NULL;
+    entry->desc.len = entry->desc.cap = 0;
+    return entry;
+}
+
+static void paramvec_free(ParamVec *vec) {
+    for (size_t i = 0; i < vec->n; ++i) {
+        free(vec->data[i].name);
+        sb_free(&vec->data[i].desc);
+    }
+    free(vec->data);
+    vec->data = NULL;
+    vec->n = vec->cap = 0;
+}
+
+typedef struct {
+    StrBuf text;
+    bool has;
+} SectionDoc;
+
+static StrBuf *section_begin(SectionDoc *sec) {
+    if (sec->has && sec->text.len > 0) sb_append(&sec->text, "\n\n");
+   sec->has = true;
+   return &sec->text;
+}
+
+static void append_param_desc(StrBuf *dest, const char *desc) {
+    if (!desc || !*desc) return;
+    for (const char *p = desc; *p; ++p) {
+        if (*p == '\n') {
+            sb_append_char(dest, '\n');
+            sb_append(dest, "  ");
+        } else {
+            sb_append_char(dest, *p);
+        }
+    }
+}
+
+static char *doxygen_to_markdown(const char *text) {
+    if (!text || !*text) return NULL;
+
+    StrBuf general = {0};
+    ParamVec params = {0};
+    SectionDoc returns = {0}, notes = {0}, warnings = {0};
+    StrBuf *current_buf = &general;
+
+    char *copy = strdup(text);
+    if (!copy) die("out of memory");
+    char *cursor = copy;
+    while (cursor) {
+        char *line = cursor;
+        char *newline = strchr(cursor, '\n');
+        if (newline) { *newline = '\0'; cursor = newline + 1; }
+        else cursor = NULL;
+
+        char *trim = line;
+        while (*trim == ' ' || *trim == '\t') trim++;
+
+        if (strncmp(trim, "@code", 5) == 0 && (trim[5] == '\0' || isspace((unsigned char)trim[5]) || trim[5] == '{')) {
+            char *lang = NULL;
+            const char *lang_start = trim + 5;
+            while (*lang_start == ' ' || *lang_start == '\t') lang_start++;
+            if (*lang_start == '{') {
+                const char *close = strchr(lang_start, '}');
+                if (close && close > lang_start + 1) lang = dup_range(lang_start + 1, (size_t)(close - lang_start - 1));
+            } else if (*lang_start) {
+                lang = strdup(lang_start);
+            }
+
+            StrBuf code = {0};
+            while (cursor) {
+                char *code_line = cursor;
+                char *code_newline = strchr(cursor, '\n');
+                if (code_newline) { *code_newline = '\0'; cursor = code_newline + 1; }
+                else cursor = NULL;
+                char *code_trim = code_line;
+                while (*code_trim == ' ' || *code_trim == '\t') code_trim++;
+                if (strncmp(code_trim, "@endcode", 8) == 0) {
+                    break;
+                }
+                sb_append(&code, code_line);
+                sb_append_char(&code, '\n');
+            }
+            sb_append_code_block(current_buf, code.buf ? code.buf : "", lang);
+            sb_free(&code);
+            free(lang);
+            continue;
+        }
+
+        bool handled = false;
+        if ((strncmp(trim, "@param", 6) == 0 && (trim[6] == '\0' || isspace((unsigned char)trim[6]))) ||
+            (strncmp(trim, "@params", 7) == 0 && (trim[7] == '\0' || isspace((unsigned char)trim[7])))) {
+            const char *rest = trim + ((trim[6] == 's') ? 7 : 6);
+            while (*rest == ' ' || *rest == '\t') rest++;
+            const char *name_start = rest;
+            while (*name_start == ' ' || *name_start == '\t') name_start++;
+            const char *name_end = name_start;
+            while (*name_end && !isspace((unsigned char)*name_end)) name_end++;
+            char *name = NULL;
+            if (name_end > name_start) name = dup_range(name_start, (size_t)(name_end - name_start));
+            ParamDoc *param = paramvec_push(&params, name ? name : "");
+            free(name);
+            const char *desc_start = name_end;
+            while (*desc_start == ' ' || *desc_start == '\t') desc_start++;
+            if (*desc_start) {
+                sb_append(&param->desc, desc_start);
+                sb_append_char(&param->desc, '\n');
+            }
+            current_buf = &param->desc;
+            handled = true;
+        } else if ((strncmp(trim, "@return", 7) == 0 && (trim[7] == '\0' || isspace((unsigned char)trim[7]))) ||
+                   (strncmp(trim, "@returns", 8) == 0 && (trim[8] == '\0' || isspace((unsigned char)trim[8])))) {
+            const char *desc = trim + ((trim[7] == 's') ? 8 : 7);
+            while (*desc == ' ' || *desc == '\t') desc++;
+            StrBuf *target = section_begin(&returns);
+            if (*desc) {
+                sb_append(target, desc);
+                sb_append_char(target, '\n');
+            }
+            current_buf = target;
+            handled = true;
+        } else if (strncmp(trim, "@note", 5) == 0 && (trim[5] == '\0' || isspace((unsigned char)trim[5]))) {
+            const char *desc = trim + 5;
+            while (*desc == ' ' || *desc == '\t') desc++;
+            StrBuf *target = section_begin(&notes);
+            if (*desc) {
+                sb_append(target, desc);
+                sb_append_char(target, '\n');
+            }
+            current_buf = target;
+            handled = true;
+        } else if (strncmp(trim, "@warning", 8) == 0 && (trim[8] == '\0' || isspace((unsigned char)trim[8]))) {
+            const char *desc = trim + 8;
+            while (*desc == ' ' || *desc == '\t') desc++;
+            StrBuf *target = section_begin(&warnings);
+            if (*desc) {
+                sb_append(target, desc);
+                sb_append_char(target, '\n');
+            }
+            current_buf = target;
+            handled = true;
+        }
+
+        if (handled) continue;
+
+        if (*trim == '\0') {
+            if (current_buf) sb_append_char(current_buf, '\n');
+        } else {
+            if (!current_buf) current_buf = &general;
+            sb_append(current_buf, trim);
+            sb_append_char(current_buf, '\n');
+        }
+    }
+    free(copy);
+
+    sb_trim_trailing_space(&general);
+    if (returns.has) sb_trim_trailing_space(&returns.text);
+    if (notes.has) sb_trim_trailing_space(&notes.text);
+    if (warnings.has) sb_trim_trailing_space(&warnings.text);
+    for (size_t i = 0; i < params.n; ++i) sb_trim_trailing_space(&params.data[i].desc);
+
+    StrBuf final = {0};
+    if (general.len) sb_append(&final, general.buf);
+
+    if (params.n) {
+        if (final.len) sb_append(&final, "\n\n");
+        sb_append(&final, "#### Parameters\n\n");
+        for (size_t i = 0; i < params.n; ++i) {
+            ParamDoc *p = &params.data[i];
+            sb_append(&final, "**");
+            sb_append(&final, p->name);
+            sb_append(&final, "** \xE2\x80\x94 ");
+            if (p->desc.len) append_param_desc(&final, p->desc.buf);
+            sb_append_char(&final, '\n');
+        }
+    }
+
+    if (returns.has && returns.text.len) {
+        if (final.len) sb_append(&final, "\n\n");
+        sb_append(&final, "#### Returns\n\n");
+        sb_append(&final, returns.text.buf);
+    }
+    if (notes.has && notes.text.len) {
+        if (final.len) sb_append(&final, "\n\n");
+        sb_append(&final, "#### Note\n\n");
+        sb_append(&final, notes.text.buf);
+    }
+    if (warnings.has && warnings.text.len) {
+        if (final.len) sb_append(&final, "\n\n");
+        sb_append(&final, "#### Warning\n\n");
+        sb_append(&final, warnings.text.buf);
+    }
+
+    sb_trim_trailing_space(&final);
+
+    char *result = NULL;
+    if (final.len) result = sb_detach(&final);
+
+    sb_free(&general);
+    paramvec_free(&params);
+    sb_free(&returns.text);
+    sb_free(&notes.text);
+    sb_free(&warnings.text);
+    sb_free(&final);
+    return result;
+}
 
 static FILE *g_out;
 static EntryVec g_macros, g_types, g_functions;
@@ -344,7 +653,9 @@ static char *normalize_comment(const char *raw) {
     result[pos] = '\0';
     free(lines);
     free(lens);
-    return result;
+    char *md = doxygen_to_markdown(result);
+    free(result);
+    return md;
 }
 
 static void print_location(CXCursor c) {
