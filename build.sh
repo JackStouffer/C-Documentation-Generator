@@ -13,7 +13,7 @@ else
     LLVM_CONFIG="llvm-config"
 fi
 
-$CLANG -std=c11 main.c -o doc_gen -I$($LLVM_CONFIG --includedir) -L$($LLVM_CONFIG --libdir) -lclang
+$CLANG -std=c11 -O3 -march=native -o doc_gen main.c -I$($LLVM_CONFIG --includedir) -L$($LLVM_CONFIG --libdir) -lclang
 
 if [ $? -eq 0 ]; then
     echo "done"
