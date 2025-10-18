@@ -23,6 +23,7 @@ typedef struct {
 
 static FILE *g_out;
 static EntryVec g_macros, g_types, g_functions;
+static StrSet g_ignore_patterns;
 
 static void die(const char *msg) { fprintf(stderr, "error: %s\n", msg); exit(1); }
 
@@ -114,6 +115,41 @@ static bool set_has(StrSet *s, const char *key) {
     for (size_t i = 0; i < s->n; ++i) if (strcmp(s->data[i], key) == 0) return true;
     return false;
 }
+static void set_free(StrSet *s) {
+    for (size_t i = 0; i < s->n; ++i) free(s->data[i]);
+    free(s->data);
+    s->data = NULL;
+    s->n = s->cap = 0;
+}
+
+static bool pattern_match(const char *pat, const char *text) {
+    if (!pat || !text) return false;
+    if (*pat == '\0') return *text == '\0';
+    if (*pat == '*') {
+        while (*pat == '*') pat++;
+        if (*pat == '\0') return true;
+        for (; *text; ++text) {
+            if (pattern_match(pat, text)) return true;
+        }
+        return pattern_match(pat, text);
+    }
+    if (*pat == '?') {
+        if (*text == '\0') return false;
+        return pattern_match(pat + 1, text + 1);
+    }
+    if (*pat == *text) {
+        return pattern_match(pat + 1, text + 1);
+    }
+    return false;
+}
+
+static bool should_ignore(const char *name) {
+    if (!name || !*name || g_ignore_patterns.n == 0) return false;
+    for (size_t i = 0; i < g_ignore_patterns.n; ++i) {
+        if (pattern_match(g_ignore_patterns.data[i], name)) return true;
+    }
+    return false;
+}
 
 static char *dup_cx(CXString s) {
     const char *c = clang_getCString(s);
@@ -182,6 +218,10 @@ static char *range_text(CXTranslationUnit tu, CXSourceRange range) {
 /* Print function prototype */
 static void emit_function(CXCursor c) {
     char *name = cursor_name(c);
+    if (should_ignore(name)) {
+        free(name);
+        return;
+    }
     const char *anchor_key = (*name) ? name : "anonymous";
     char *anchor = make_anchor("function", anchor_key);
     entryvec_add(&g_functions, anchor_key, anchor, NULL);
@@ -220,6 +260,10 @@ static enum CXChildVisitResult struct_enum_visitor(CXCursor c, CXCursor parent, 
 static void emit_record(CXCursor c, const char *what) {
     char *name = cursor_name(c);
     const char *display = (*name) ? name : "(anonymous)";
+    if (should_ignore(display)) {
+        free(name);
+        return;
+    }
     char prefix[64];
     snprintf(prefix, sizeof(prefix), "type-%s", what);
     char *anchor = make_anchor(prefix, display);
@@ -240,6 +284,11 @@ static void emit_typedef(CXCursor c) {
     CXType ut = clang_getTypedefDeclUnderlyingType(c);
     char *uts = type_spelling(ut);
     const char *display = (*name) ? name : "(anonymous)";
+    if (should_ignore(display)) {
+        free(name);
+        free(uts);
+        return;
+    }
     char *anchor = make_anchor("type-typedef", display);
     entryvec_add(&g_types, display, anchor, "Typedef");
     fprintf(g_out, "<a id=\"%s\"></a>\n", anchor);
@@ -256,6 +305,10 @@ static void emit_typedef(CXCursor c) {
 static void emit_macro(CXCursor c, CXTranslationUnit tu) {
     char *name = cursor_name(c);
     const char *display = (*name) ? name : "(anonymous)";
+    if (should_ignore(display)) {
+        free(name);
+        return;
+    }
     char *anchor = make_anchor("macro", display);
     entryvec_add(&g_macros, display, anchor, NULL);
     fprintf(g_out, "<a id=\"%s\"></a>\n", anchor);
@@ -330,8 +383,7 @@ static void process_file(CXIndex idx, const char *path, int clang_argc, const ch
     clang_disposeTranslationUnit(tu);
 
     // cleanup set
-    for (size_t i = 0; i < ctx.seen.n; ++i) free(ctx.seen.data[i]);
-    free(ctx.seen.data);
+    set_free(&ctx.seen);
 }
 
 int main(int argc, const char **argv) {
@@ -339,10 +391,25 @@ int main(int argc, const char **argv) {
         fprintf(stderr, "usage: %s <file.c|file.h>... [-- <clang-args...>]\n", argv[0]);
         return 2;
     }
-    int split = argc;
-    for (int i = 1; i < argc; ++i) if (strcmp(argv[i], "--") == 0) { split = i; break; }
+    int argi = 1;
+    while (argi < argc && strcmp(argv[argi], "--") != 0) {
+        if (strcmp(argv[argi], "--ignore") == 0) {
+            if (argi + 1 >= argc) die("missing pattern after --ignore");
+            set_add(&g_ignore_patterns, argv[argi + 1]);
+            argi += 2;
+            continue;
+        }
+        break;
+    }
 
-    int nfiles = split - 1;
+    int split = argc;
+    for (int i = argi; i < argc; ++i) if (strcmp(argv[i], "--") == 0) { split = i; break; }
+
+    for (int i = argi; i < split; ++i) {
+        if (strcmp(argv[i], "--ignore") == 0) die("--ignore must appear before input files");
+    }
+
+    int nfiles = split - argi;
     if (nfiles <= 0) die("no input files");
     int cargc = (split < argc) ? (argc - split - 1) : 0;
     const char **cargv = (cargc > 0) ? (argv + split + 1) : NULL;
@@ -352,8 +419,8 @@ int main(int argc, const char **argv) {
     g_out = body;
     printf("# API Documentation\n\n");
     CXIndex idx = clang_createIndex(/*excludeDeclsFromPCH=*/0, /*displayDiagnostics=*/0);
-    for (int i = 1; i <= nfiles; ++i) {
-        process_file(idx, argv[i], cargc, cargv);
+    for (int i = 0; i < nfiles; ++i) {
+        process_file(idx, argv[argi + i], cargc, cargv);
     }
     clang_disposeIndex(idx);
     print_summary_section("Macros", &g_macros, false);
@@ -369,5 +436,6 @@ int main(int argc, const char **argv) {
     entryvec_free(&g_macros);
     entryvec_free(&g_types);
     entryvec_free(&g_functions);
+    set_free(&g_ignore_patterns);
     return 0;
 }
