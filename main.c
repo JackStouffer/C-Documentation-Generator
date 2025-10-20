@@ -5,6 +5,9 @@
 #include <string.h>
 #include <stdbool.h>
 
+#define DOCSTRING_START "<!--DOCSTRING_START-->"
+#define DOCSTRING_END   "<!--DOCSTRING_END-->"
+
 static void die(const char *msg);
 static char *dup_range(const char *src, size_t len);
 
@@ -71,6 +74,16 @@ static void sb_trim_trailing_space(StrBuf *sb) {
         sb->len--;
     }
     if (sb->buf) sb->buf[sb->len] = '\0';
+}
+
+static void trim_trailing_space(char *s) {
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0) {
+        unsigned char ch = (unsigned char)s[len - 1];
+        if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') break;
+        s[--len] = '\0';
+    }
 }
 
 static void sb_ensure_blank_line(StrBuf *sb) {
@@ -296,7 +309,7 @@ static char *doxygen_to_markdown(const char *text) {
             sb_append(&final, p->name);
             sb_append(&final, "** \xE2\x80\x94 ");
             if (p->desc.len) append_param_desc(&final, p->desc.buf);
-            sb_append_char(&final, '\n');
+            sb_append(&final, "\n\n");
         }
     }
 
@@ -404,6 +417,19 @@ static void entryvec_free(EntryVec *vec) {
     vec->n = vec->cap = 0;
 }
 
+static const char *entryvec_lookup_anchor(const EntryVec *vec, const char *name, size_t len) {
+    if (!vec || !name) return NULL;
+    for (size_t i = 0; i < vec->n; ++i) {
+        Entry *e = &vec->data[i];
+        if (!e->name) continue;
+        size_t elen = strlen(e->name);
+        if (elen == len && strncmp(e->name, name, len) == 0) {
+            return e->anchor;
+        }
+    }
+    return NULL;
+}
+
 static char *make_anchor(const char *prefix, const char *name) {
     size_t plen = strlen(prefix);
     size_t nlen = strlen(name);
@@ -470,6 +496,15 @@ static void set_free(StrSet *s) {
     free(s->data);
     s->data = NULL;
     s->n = s->cap = 0;
+}
+
+static const char *find_anchor_for_name(const char *name, size_t len) {
+    if (!name || len == 0) return NULL;
+    const char *anchor = entryvec_lookup_anchor(&g_functions, name, len);
+    if (anchor) return anchor;
+    anchor = entryvec_lookup_anchor(&g_types, name, len);
+    if (anchor) return anchor;
+    return entryvec_lookup_anchor(&g_macros, name, len);
 }
 
 static bool pattern_match(const char *pat, const char *text) {
@@ -761,6 +796,13 @@ static char *extract_file_doc(const char *path) {
     return md;
 }
 
+static void write_docstring_block(const char *md) {
+    if (!md || !*md) return;
+    fprintf(g_out, "%s\n", DOCSTRING_START);
+    fprintf(g_out, "%s\n", md);
+    fprintf(g_out, "%s\n\n", DOCSTRING_END);
+}
+
 static char *bump_markdown_headers(const char *text) {
     if (!text || !*text) return NULL;
     StrBuf out = {0};
@@ -806,6 +848,123 @@ static char *bump_markdown_headers(const char *text) {
     return result;
 }
 
+static bool is_word_char(char c) {
+    return (c == '_') || isalnum((unsigned char)c);
+}
+
+static char *link_docstring_segment(const char *text) {
+    if (!text) return NULL;
+    if (*text == '\0') return dup_range("", 0);
+    StrBuf out = {0};
+    const char *line_ptr = text;
+    bool in_code_block = false;
+
+    while (line_ptr && *line_ptr) {
+        const char *line_end = strchr(line_ptr, '\n');
+        size_t line_len = line_end ? (size_t)(line_end - line_ptr) : strlen(line_ptr);
+        const char *trim = line_ptr;
+        while ((size_t)(trim - line_ptr) < line_len && (*trim == ' ' || *trim == '\t')) trim++;
+        bool is_fence = (line_len - (size_t)(trim - line_ptr) >= 3 && strncmp(trim, "```", 3) == 0);
+        bool process = !in_code_block && !is_fence;
+
+        if (process) {
+            bool in_inline_code = false;
+            size_t i = 0;
+            while (i < line_len) {
+                char ch = line_ptr[i];
+                if (ch == '`') {
+                    sb_append_char(&out, ch);
+                    in_inline_code = !in_inline_code;
+                    i++;
+                    continue;
+                }
+                if (!in_inline_code && is_word_char(ch)) {
+                    size_t start = i;
+                    while (i < line_len && is_word_char(line_ptr[i])) i++;
+                    size_t word_len = i - start;
+                    const char *anchor = find_anchor_for_name(line_ptr + start, word_len);
+                    if (anchor) {
+                        sb_append_char(&out, '[');
+                        sb_append_n(&out, line_ptr + start, word_len);
+                        sb_append(&out, "](#");
+                        sb_append(&out, anchor);
+                        sb_append_char(&out, ')');
+                        continue;
+                    }
+                    sb_append_n(&out, line_ptr + start, word_len);
+                    continue;
+                }
+                sb_append_char(&out, ch);
+                i++;
+            }
+        } else {
+            sb_append_n(&out, line_ptr, line_len);
+        }
+
+        if (line_end) {
+            sb_append_char(&out, '\n');
+            line_ptr = line_end + 1;
+        } else {
+            break;
+        }
+
+        if (is_fence) {
+            in_code_block = !in_code_block;
+        }
+    }
+
+    char *result = sb_detach(&out);
+    sb_free(&out);
+    return result;
+}
+
+static char *apply_docstring_links(const char *input) {
+    if (!input) return NULL;
+    const char *start_tag = DOCSTRING_START;
+    const char *end_tag = DOCSTRING_END;
+    size_t start_len = strlen(start_tag);
+    size_t end_len = strlen(end_tag);
+
+    StrBuf out = {0};
+    const char *cursor = input;
+    while (cursor && *cursor) {
+        const char *start = strstr(cursor, start_tag);
+        if (!start) {
+            sb_append(&out, cursor);
+            break;
+        }
+        sb_append_n(&out, cursor, (size_t)(start - cursor));
+        const char *segment = start + start_len;
+        if (*segment == '\r') segment++;
+        if (*segment == '\n') segment++;
+        const char *end = strstr(segment, end_tag);
+        if (!end) {
+            sb_append(&out, start);
+            break;
+        }
+        const char *segment_end = end;
+        while (segment_end > segment && (segment_end[-1] == '\n' || segment_end[-1] == '\r')) {
+            segment_end--;
+        }
+        size_t seg_len = (size_t)(segment_end - segment);
+        char *raw_seg = dup_range(segment, seg_len);
+        char *linked = link_docstring_segment(raw_seg);
+        sb_append(&out, linked ? linked : raw_seg);
+        sb_append(&out, "\n\n");
+        free(linked);
+        free(raw_seg);
+
+        const char *after = end + end_len;
+        if (*after == '\r') after++;
+        if (*after == '\n') after++;
+        if (*after == '\r') after++;
+        if (*after == '\n') after++;
+        cursor = after;
+    }
+
+    return sb_detach(&out);
+}
+
 static void print_location(CXCursor c) {
     CXSourceLocation loc = clang_getCursorLocation(c);
     CXFile file; unsigned line, col, off;
@@ -820,7 +979,7 @@ static bool print_md_comment(CXCursor c) {
     char *norm = normalize_comment(raw);
     free(raw);
     if (norm && *norm) {
-        fprintf(g_out, "%s\n\n", norm);
+        write_docstring_block(norm);
         free(norm);
         return true;
     }
@@ -881,16 +1040,68 @@ static void emit_function(CXCursor c) {
     CXType ft = clang_getCursorType(c);
     CXType rt = clang_getResultType(ft);
     char *rts = type_spelling(rt);
-    char *disp = dup_cx(clang_getCursorDisplayName(c)); // name(params)
+    trim_trailing_space(rts);
     fprintf(g_out, "### Function: `%s`\n\n", name);
     print_md_comment(c);
-    char line[4096];
-    snprintf(line, sizeof(line), "%s %s;", rts, disp);
-    print_code_block(line);
+    StrBuf proto = {0};
+    int num_args = clang_Cursor_getNumArguments(c);
+    bool variadic = clang_isFunctionTypeVariadic(ft);
+    if (num_args >= 0) {
+        sb_append(&proto, rts);
+        sb_append_char(&proto, ' ');
+        sb_append(&proto, name);
+        sb_append(&proto, "(");
+        for (int i = 0; i < num_args; ++i) {
+            if (i > 0) sb_append(&proto, ", ");
+            CXCursor arg_cursor = clang_Cursor_getArgument(c, (unsigned)i);
+            char *arg_name = cursor_name(arg_cursor);
+            CXType arg_type = clang_getArgType(ft, (unsigned)i);
+            char *arg_ts = type_spelling(arg_type);
+            if ((!arg_ts || !*arg_ts) && !clang_equalTypes(arg_type, clang_getCursorType(arg_cursor))) {
+                free(arg_ts);
+                arg_ts = type_spelling(clang_getCursorType(arg_cursor));
+            }
+            trim_trailing_space(arg_ts);
+            if (arg_ts && *arg_ts) sb_append(&proto, arg_ts);
+            if (arg_name && *arg_name) {
+                if (arg_ts && *arg_ts) {
+                    size_t tlen = strlen(arg_ts);
+                    if (tlen > 0) {
+                        char last = arg_ts[tlen - 1];
+                        if (isalnum((unsigned char)last) || last == '_' || last == ')') {
+                            sb_append_char(&proto, ' ');
+                        }
+                    }
+                }
+                sb_append(&proto, arg_name);
+            }
+            free(arg_name);
+            free(arg_ts);
+        }
+        if (variadic) {
+            if (num_args > 0) sb_append(&proto, ", ...");
+            else sb_append(&proto, "...");
+        }
+        sb_append(&proto, ");");
+    }
+    if (proto.buf && proto.len > 0) {
+        char *proto_line = sb_detach(&proto);
+        print_code_block(proto_line);
+        free(proto_line);
+        sb_free(&proto);
+    } else {
+        sb_free(&proto);
+        char *disp = dup_cx(clang_getCursorDisplayName(c));
+        char line[4096];
+        snprintf(line, sizeof(line), "%s %s;", rts, disp);
+        print_code_block(line);
+        free(disp);
+    }
     print_location(c);
     fprintf(g_out, "---\n\n");
     free(anchor);
-    free(name); free(rts); free(disp);
+    free(name);
+    free(rts);
 }
 
 /* Collect struct/union fields or enum constants. */
@@ -944,7 +1155,7 @@ static void emit_typedef(CXCursor c) {
         return;
     }
     char *anchor = make_anchor("type-typedef", display);
-    entryvec_add(&g_types, display, anchor, "Typedef");
+    entryvec_add(&g_types, display, anchor, NULL);
     fprintf(g_out, "<a id=\"%s\"></a>\n", anchor);
     fprintf(g_out, "### Typedef: `%s`\n\n", name);
     print_md_comment(c);
@@ -973,7 +1184,7 @@ static void emit_macro(CXCursor c, CXTranslationUnit tu) {
         char *manual = extract_macro_comment(tu, c);
         char *norm = normalize_comment(manual);
         if (norm && *norm) {
-            fprintf(g_out, "%s\n\n", norm);
+            write_docstring_block(norm);
         }
         free(norm);
         free(manual);
@@ -1014,9 +1225,9 @@ static enum CXChildVisitResult tu_visitor(CXCursor c, CXCursor parent, CXClientD
             // Emit the first declaration/definition we encounter; USR dedupe avoids repeats.
             emit_function(c);
             break;
-        case CXCursor_StructDecl: emit_record(c, "Struct"); break;
-        case CXCursor_UnionDecl:  emit_record(c, "Union");  break;
-        case CXCursor_EnumDecl:   emit_record(c, "Enum");   break;
+        case CXCursor_StructDecl: emit_record(c, ""); break;
+        case CXCursor_UnionDecl:  emit_record(c, "");  break;
+        case CXCursor_EnumDecl:   emit_record(c, "");   break;
         case CXCursor_TypedefDecl: emit_typedef(c); break;
         case CXCursor_MacroDefinition:
             // Skip system headers, but allow project/local headers included by the file.
@@ -1053,7 +1264,8 @@ static void process_file(CXIndex idx, const char *path, int clang_argc, const ch
     fprintf(g_out, "## File: %s\n\n", path);
     if (have_file_doc) {
         char *adjusted = bump_markdown_headers(file_doc);
-        fprintf(g_out, "%s\n\n", adjusted ? adjusted : file_doc);
+        const char *doc = adjusted ? adjusted : file_doc;
+        write_docstring_block(doc);
         free(adjusted);
     }
     clang_visitChildren(clang_getTranslationUnitCursor(tu), tu_visitor, &ctx);
@@ -1123,12 +1335,21 @@ int main(int argc, const char **argv) {
     print_summary_section("Types", &g_types, true);
     print_summary_section("Functions", &g_functions, false);
     rewind(body);
+    StrBuf output = {0};
     char buf[4096];
     size_t read_bytes;
     while ((read_bytes = fread(buf, 1, sizeof(buf), body)) > 0) {
-        fwrite(buf, 1, read_bytes, stdout);
+        sb_append_n(&output, buf, read_bytes);
     }
     fclose(body);
+    char *linked = apply_docstring_links(output.buf ? output.buf : "");
+    if (linked) {
+        fwrite(linked, 1, strlen(linked), stdout);
+        free(linked);
+    } else if (output.buf && output.len) {
+        fwrite(output.buf, 1, output.len, stdout);
+    }
+    sb_free(&output);
     entryvec_free(&g_macros);
     entryvec_free(&g_types);
     entryvec_free(&g_functions);
