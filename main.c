@@ -1179,6 +1179,23 @@ static void emit_typedef(CXCursor c) {
         free(uts);
         return;
     }
+    bool skip_alias = false;
+    CXCursor ut_decl = clang_getTypeDeclaration(ut);
+    if (!clang_Cursor_isNull(ut_decl)) {
+        enum CXCursorKind kind = clang_getCursorKind(ut_decl);
+        if (kind == CXCursor_StructDecl || kind == CXCursor_UnionDecl || kind == CXCursor_EnumDecl) {
+            char *ut_name = cursor_name(ut_decl);
+            if (ut_name && *ut_name && name && strcmp(ut_name, name) == 0) {
+                skip_alias = true;
+            }
+            free(ut_name);
+        }
+    }
+    if (skip_alias) {
+        free(name);
+        free(uts);
+        return;
+    }
     char *anchor = make_anchor("type-typedef", display);
     entryvec_add(&g_types, display, anchor, NULL);
     fprintf(g_out, "<a id=\"%s\"></a>\n", anchor);
