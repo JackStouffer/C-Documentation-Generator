@@ -1,3 +1,28 @@
+/**
+ * # Jack's Simple Markdown Doc Generator
+ * 
+ * In my projects I wanted a way to generate a single markdown file for all of
+ * the code in a library, which is checked into the repo and shipped with the
+ * library. C API doc generators are very complicated and hard to use. This is
+ * a single program which does exactly what I need.
+ * 
+ * This command-line utility walks one or more C headers or source files and
+ * extracts their docstrings. The output includes per-file sections, structured summaries
+ * for macros, types, and functions, and code snippets reproduced as fenced code
+ * blocks.
+ * 
+ * The tool is powered by libclang, allowing it to parse real-world C projects
+ * while respecting macros, typedefs, and other language constructs. It is
+ * designed to be run directly against a project header from a terminal, making
+ * it easy to regenerate documentation as part of a build or release pipeline.
+ * 
+ * ## License
+ * 
+ * This file is dedicated to the public domain under CC0 1.0.
+ * To the extent possible under law, [Your Name] has waived all copyright and related rights.
+ * See <https://creativecommons.org/publicdomain/zero/1.0/> for details.
+ */
+
 #include <clang-c/Index.h>
 #include <ctype.h>
 #include <stdio.h>

@@ -1,13 +1,12 @@
 # Doc Generator
 
-In my projects I wanted a way to generate a single markdown file for the library
-docs which is included and shipped with the library. C API doc generators
-are very complicated and hard to use. This is a single program which does
-exactly what I need.
+In my projects I wanted a way to generate a single markdown file for all of
+the code in a library, which is checked into the repo and shipped with the
+library. C API doc generators are very complicated and hard to use. This is
+a single program which does exactly what I need.
 
-This command-line utility walks one or more C headers or source files,
-extracts their docstrings, and emits a single Markdown document summarizing
-the public API. The output includes per-file sections, structured summaries
+This command-line utility walks one or more C headers or source files and
+extracts their docstrings. The output includes per-file sections, structured summaries
 for macros, types, and functions, and code snippets reproduced as fenced code
 blocks.
 
@@ -16,7 +15,7 @@ while respecting macros, typedefs, and other language constructs. It is
 designed to be run directly against a project header from a terminal, making
 it easy to regenerate documentation as part of a build or release pipeline.
 
-**WARNING** - this tool is vibecoded because it's tooling and I don't really
+**WARNING** - this tool is 100% LLM generated because it's tooling and I don't really
 care about the code quality. I make no guarantees about the workability of this
 code to the very broad range of possible C projects.
 
@@ -76,4 +75,4 @@ If your project requires specific include paths or defines, supply them after a 
 
 ## License
 
-This project is distributed under the MIT License. See [`LICENSE`](LICENSE) for details (if present).
+This project is release into the public domain under the CC0. See LICENSE.md
