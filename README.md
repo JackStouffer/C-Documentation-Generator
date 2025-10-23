@@ -5,15 +5,11 @@ the code in a library, which is checked into the repo and shipped with the
 library. C API doc generators are very complicated and hard to use. This is
 a single program which does exactly what I need.
 
-This command-line utility walks one or more C headers or source files and
-extracts their docstrings. The output includes per-file sections, structured summaries
-for macros, types, and functions, and code snippets reproduced as fenced code
-blocks.
-
-The tool is powered by libclang, allowing it to parse real-world C projects
-while respecting macros, typedefs, and other language constructs. It is
-designed to be run directly against a project header from a terminal, making
-it easy to regenerate documentation as part of a build or release pipeline.
+This command-line utility walks one or more C headers or source files, extracts
+their docstrings, parses simple doxygen, and outputs a single markdown file
+for all of the headers. The output includes each top level comment for the files,
+a complete and linked table of contents, and different sections for macros, types,
+and functions.
 
 **WARNING** - this tool is 100% LLM generated because it's tooling and I don't really
 care about the code quality. I make no guarantees about the workability of this
